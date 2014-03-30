@@ -1,7 +1,8 @@
 import os
-import subprocess
 import tempfile
 import requests
+from selenium import webdriver
+import time
 import warcprox.warcprox as warcprox
 import thread
 import errno
@@ -14,7 +15,6 @@ from celery.utils.log import get_task_logger
 ### CELERY SETUP ###
 
 app = Celery()
-app.config_from_object('celeryconfig')
 
 logger = get_task_logger(__name__)
 
@@ -28,16 +28,26 @@ SCRIPT_PATH = os.environ.get('WARC_CREATOR_SCRIPT_PATH', os.path.join(__location
 class ConfigError(Exception):
     pass
 
+def send_result(url, params, file_path=None):
+    if file_path:
+        with open(file_path, 'rb') as f:
+            resp = requests.post(url, params=params, files={'file': f})
+            print resp, dir(resp), resp.content, resp.text
+    else:
+        requests.post(url, params=params)
+
 
 ### TASKS ###
 
 @app.task
-def proxy_capture(target_url, callback_url, extra_info='', script_path=SCRIPT_PATH):
+def proxy_capture(target_url, callback_url, user_agent='Perma', script_path=SCRIPT_PATH):
     """
         Start proxy, call PhantomJS with a javascript file to load requested url, send WARC file to callback_url.
     """
     # set up paths
     storage_path = tempfile.mkdtemp()
+    print "Saving to", storage_path
+    image_path = os.path.join(storage_path, 'cap.png')
     cert_path = os.path.join(storage_path, 'cert.pem')
 
     if not script_path:
@@ -66,16 +76,13 @@ def proxy_capture(target_url, callback_url, extra_info='', script_path=SCRIPT_PA
         def _close_writer(self):
             if self._fpath:
                 super(WarcWriter, self)._close_writer()
-                warc_file_path = os.path.join(storage_path, self._f_finalname)
-                callback_params = {'type':'warc'}
+                warc_path = os.path.join(storage_path, self._f_finalname)
                 try:
-                    with open(warc_file_path, 'rb') as warc_file:
-                        requests.post(callback_url, params=callback_params, files={'file':warc_file})
+                    send_result(callback_url, {'type':'warc'}, warc_path)
                 except OSError:
                     logger.warning("Web Archive File creation failed for %s" % target_url)
-                    callback_params['error'] = 1
-                    requests.get(callback_url, params=callback_params)
-                os.rmdir(storage_path)
+                    send_result(callback_url, {'type': 'warc', 'error':1})
+                #os.rmdir(storage_path)
 
     # start warcprox listener
     warc_writer = WarcWriter(recorded_url_q=warcprox_url_queue,
@@ -85,20 +92,42 @@ def proxy_capture(target_url, callback_url, extra_info='', script_path=SCRIPT_PA
     warcprox_controller = warcprox.WarcproxController(proxy, warc_writer)
     thread.start_new_thread(warcprox_controller.run_until_shutdown, ())
 
-    # run phantomjs
     try:
-        subprocess.call([
-            'phantomjs',
-            "--proxy=127.0.0.1:%s" % warcprox_port,
-            "--ssl-certificates-path=%s" % cert_path,
-            "--ignore-ssl-errors=true",
-            script_path,
-            target_url,
-            storage_path,
-            callback_url,
-            extra_info
-        ])
-        #time.sleep(.5)  # give warcprox a chance to save everything
+
+        # run selenium/phantomjs
+        from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+        desired_capabilities = dict(DesiredCapabilities.PHANTOMJS)
+        desired_capabilities["phantomjs.page.settings.userAgent"] = user_agent
+        driver = webdriver.PhantomJS(desired_capabilities=desired_capabilities,
+                                     service_args=[
+                                         "--proxy=127.0.0.1:%s" % warcprox_port,
+                                         "--ssl-certificates-path=%s" % cert_path,
+                                         "--ignore-ssl-errors=true",
+                                     ])
+
+        driver.set_window_size(1024, 800)
+        print "Getting", target_url
+        driver.get(target_url) # returns after onload
+        time.sleep(.8) # finish rendering
+        driver.save_screenshot(image_path)
+        driver.quit()
+
+        send_result(callback_url, {'type': 'image'}, image_path)
+
+
+
+        #     subprocess.call([
+        #         'node',
+        #         script_path,
+        #         "--proxy=127.0.0.1:%s;--ssl-certificates-path=%s;--ignore-ssl-errors=true" % warcprox_port,
+        #         "" % cert_path,
+        #         "",
+        #         target_url,
+        #         storage_path,
+        #         callback_url,
+        #         extra_info
+        #     ])
+        #     #time.sleep(.5)  # give warcprox a chance to save everything
     finally:
         # shutdown warcprox process
         warcprox_controller.stop.set()
